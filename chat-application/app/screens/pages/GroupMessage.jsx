@@ -1,18 +1,26 @@
-import axios from "axios"; // ✅ API calls
+import axios from "axios";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   Alert,
   Animated,
   Keyboard,
   KeyboardAvoidingView,
   Platform,
+  StatusBar,
   Text,
   TouchableOpacity,
   TouchableWithoutFeedback,
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import BlockedOverlay from "../components/BlockContact/BlockedOverlay";
 import GroupChatHeader from "../components/GroupChatHeader/GroupChatHeader";
@@ -24,7 +32,7 @@ import { useSelector } from "react-redux";
 import { getSocket } from "../../services/socketService";
 
 const GroupMessage = () => {
- // ------------------- STATE -------------------
+  // ------------------- STATE -------------------
   const [messages, setMessages] = useState([]);
   const [selectedMessages, setSelectedMessages] = useState([]);
   const [editingMessageId, setEditingMessageId] = useState(null);
@@ -33,29 +41,38 @@ const GroupMessage = () => {
   const [hasLeftGroup, setHasLeftGroup] = useState(false);
   const [wallpaperUri, setWallpaperUri] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [type, setType] = useState("group"); // "single" or "group"
+
   const router = useRouter();
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const flatListRef = useRef(null);
 
   const currentUserId = useSelector((state) => state.auth.user.id);
-  const user = useSelector((state)=>state.auth.user);
-
+  const user = useSelector((state) => state.auth.user);
   const params = useLocalSearchParams();
-  let GroupDetails = params.groupedata;
 
-  // Parse JSON if passed as string
-  try {
-    if (typeof GroupDetails === "string") {
-      GroupDetails = JSON.parse(GroupDetails);
+  // ------------------- GROUP DETAILS (safe parse) -------------------
+  const GroupDetails = useMemo(() => {
+    let data = params.groupedata;
+    if (typeof data === "string") {
+      try {
+        data = JSON.parse(data);
+      } catch (e) {
+        console.error("Parse error:", e);
+        return null;
+      }
     }
-    console.log("This is the grp data ", GroupDetails);
-    
-  } catch (e) {
-    console.log("Failed to parse GroupDetails:", e);
+    return data || null;
+  }, [params.groupedata]);
+
+  if (!GroupDetails?.id) {
+    return (
+      <SafeAreaView className="flex-1 justify-center items-center bg-slate-50">
+        <Text className="text-lg text-gray-600">Invalid group</Text>
+      </SafeAreaView>
+    );
   }
 
-  // ------------------ Load Wallpaper ------------------
+  // ------------------- LOAD WALLPAPER -------------------
   useEffect(() => {
     (async () => {
       const uri = await AsyncStorage.getItem("chat_wallpaper");
@@ -63,160 +80,149 @@ const GroupMessage = () => {
     })();
   }, []);
 
-  // ------------------ Fetch Messages ------------------
-    const fetchMessages = async () => {
+  // ------------------- FETCH MESSAGES -------------------
+  const fetchMessages = useCallback(async () => {
     const token = await SecureStore.getItemAsync("token");
-    if (!token) {
-      Alert.alert("please login again");
-      return router.replace("/screens/home");
-    }
+    if (!token) return router.replace("/screens/home");
+
     try {
-      const response = await axios.get(
+      const res = await axios.get(
         `${process.env.EXPO_API_URL}/get/group/messages`,
         {
           params: { groupId: GroupDetails.id },
           headers: { Authorization: `Bearer ${token}` },
         }
       );
-      
-      // console.log("GroupData", response.data);
-      if (response.data.success) {
-        const messages = response.data.messages.map((msg) => ({
-          ...msg,
-          isSender: msg.sender_id === currentUserId, // currentUserId = logged-in user's id
-        }));
-        setMessages(messages);
-        setType("group");
-        setIsBlocked(response.data.isBlocked);
-        setHasLeftGroup(response.data.hasLeftGroup);
-      } else {
-        Alert.alert(
-          "Error",
-          response.data.message || "Failed to fetch messages"
-        );
-      }
-    } catch (error) {
-      console.error("Error fetching messages:", error);
-      Alert.alert("Error", error.message || "Failed to fetch messages");
-    }
-  };
 
+      if (res.data.success) {
+        const normalized = res.data.messages.map((msg) => ({
+          ...msg,
+          _id: msg._id || msg.id,
+          id: msg.id || msg._id,
+          isSender: msg.sender_id === currentUserId,
+        }));
+        setMessages(normalized);
+        setIsBlocked(res.data.isBlocked ?? false);
+        setHasLeftGroup(res.data.hasLeftGroup ?? false);
+      }
+    } catch (err) {
+      console.error("Fetch failed:", err);
+    }
+  }, [GroupDetails.id, currentUserId, router]);
+
+  // ------------------- SOCKET HANDLERS -------------------
+  const handleGroupNewMessage = useCallback((data) => {
+    console.log("🧪 SOCKET DATA:", data); // ← DEBUG LOG
+
+    // 🔥 FIXED: Handle ALL backend formats
+    let newMessages = [];
+
+    if (data.newGroupMessages && Array.isArray(data.newGroupMessages)) {
+      newMessages = data.newGroupMessages; // ✅ Batch images
+    } else if (data.newGroupMessage && typeof data.newGroupMessage === 'object') {
+      newMessages = [data.newGroupMessage]; // ✅ Single message
+    } else if (Array.isArray(data)) {
+      newMessages = data; // ✅ Legacy array
+    } else if (typeof data === 'object') {
+      newMessages = [data]; // ✅ Single object
+    }
+
+    console.log("🧪 PROCESSED MESSAGES:", newMessages); // ← DEBUG LOG
+
+    newMessages.forEach((msg) => {
+      if (!msg || msg.group_id !== GroupDetails.id) return;
+
+      const msgId = msg._id || msg.id;
+      if (!msgId) return;
+
+      setMessages((prev) => {
+        const exists = prev.some((m) => (m._id || m.id) === msgId);
+        if (exists) return prev;
+
+        return [
+          ...prev,
+          {
+            ...msg,
+            _id: msgId,
+            id: msgId,
+            isSender: msg.sender_id === currentUserId,
+          },
+        ];
+      });
+    });
+  }, [GroupDetails.id, currentUserId]);
+
+  const handleDeletedMessage = useCallback(({ messageId }) => {
+    const id = messageId?._id || messageId?.id || messageId;
+    if (!id) return;
+    setMessages((prev) => prev.filter((m) => m._id !== id && m.id !== id));
+  }, []);
+
+  const handleUpdatedMessage = useCallback((updatedMsg) => {
+    const msgId = updatedMsg._id || updatedMsg.id;
+    if (!msgId) return;
+    setMessages((prev) =>
+      prev.map((m) =>
+        m._id === msgId || m.id === msgId
+          ? { ...m, ...updatedMsg, _id: msgId, id: msgId }
+          : m
+      )
+    );
+  }, []);
+
+  const handleMessageStatusUpdate = useCallback(
+    ({ message_id, status }) => {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m._id === message_id || m.id === message_id ? { ...m, status } : m
+        )
+      );
+    },
+    []
+  );
+
+  // ------------------- SOCKET SETUP -------------------
   useEffect(() => {
     fetchMessages();
 
     const socket = getSocket();
     if (!socket) return;
 
-    // 🔹 Handle new incoming messages
- const handleNewMessage = async (msg) => {
-      // Only consider messages between me and current chat user
-      if (msg.group_id === GroupDetails.id) {
-        setMessages((prev) => [...prev, msg]);
-
-        // If message is from the other user, mark as delivered immediately
-        if (
-          msg.sender_id === GroupDetails?.id &&
-          msg.groupId === me.id
-        ) {
-          console.log("in teh delivered");
-
-          await axios
-            .post(`${process.env.EXPO_API_URL}/messages/${msg.id}/delivered`)
-            .catch(console.log);
-
-          // Don't mark as read immediately here
-          // Read will be marked in MessagesList via handleViewableItemsChanged
-        }
-      }
-    };
-
-
-
-    // 🔹 Other handlers (deleted, updated, status)
-    const handleDeletedMessage = ({ messageId, sender_id, groupId }) => {
-      if (
-        (sender_id === me.id && groupId === GroupDetails?.id) ||
-        (sender_id === GroupDetails?.id && groupId === me.id)
-      ) {
-        setMessages((prev) => prev.filter((msg) => msg.id !== messageId));
-      }
-    };
-
-    const handleUpdatedMessage = (updatedMsg) => {
-      if (
-        (updatedMsg.sender_id === me.id &&
-          updatedMsg.groupId === GroupDetails?.id)
-          //  || (updatedMsg.sender_id === GroupDetails?.id &&
-          // updatedMsg.groupId === me.id)
-      ) {
-        setMessages((prev) =>
-          prev.map((msg) =>
-            String(msg.id) === String(updatedMsg.id)
-              ? { ...msg, ...updatedMsg }
-              : msg
-          )
-        );
-      }
-    };
-
-    const handleMessageStatusUpdate = ({ message_id, status }) => {
-      setMessages((prev) =>
-        prev.map((msg) =>
-          String(msg.id) === String(message_id) ? { ...msg, status } : msg
-        )
-      );
-    };
-
-    // const handleGroupNewMessage = ({ newGroupMessage }) => {
-    //    console.log("this is the New Message in group", newGroupMessage);
-    //   // console.log(
-    //   //   "------------------------------------- \nThis is the current chat user \n",
-    //   //   GroupDetails
-    //   // );
-    //   // console.log(
-    //   //   "------------------------------------- \nThis is the current main user \n",
-    //   //   me
-    //   // );
-    // };
-
-        const handleGroupNewMessage = (data) => {
-      const msg = data.newGroupMessage || data;
-      if (msg.group_id === GroupDetails.id) {
-        setMessages(prev => {
-          if (prev.some(me => me.id === msg.id)) return prev; // avoid duplicate
-          return [...prev, { ...msg, isSender: msg.sender_id === currentUserId }];
-        });
-      }
-    };
-
-
-    // 🔹 Register socket listeners
-    // socket.on("groupNewMessage", handleNewMessage);
+    socket.on("groupNewMessage", handleGroupNewMessage);
     socket.on("groupMessageDeleted", handleDeletedMessage);
     socket.on("message_updated", handleUpdatedMessage);
     socket.on("message_status_update", handleMessageStatusUpdate);
-    socket.on("groupNewMessage", handleGroupNewMessage);
 
-    // 🔹 Cleanup
     return () => {
-      socket.off("groupNewMessage", handleNewMessage);
+      socket.off("groupNewMessage", handleGroupNewMessage);
       socket.off("groupMessageDeleted", handleDeletedMessage);
       socket.off("message_updated", handleUpdatedMessage);
       socket.off("message_status_update", handleMessageStatusUpdate);
-      socket.on("groupNewMessage", handleGroupNewMessage);
     };
-  }, [currentUserId, GroupDetails?.id]);
+  }, [
+    fetchMessages,
+    handleGroupNewMessage,
+    handleDeletedMessage,
+    handleUpdatedMessage,
+    handleMessageStatusUpdate,
+  ]);
 
-  // ------------------ Message Selection ------------------
+  // ------------------- AUTO-SCROLL -------------------
+  useEffect(() => {
+    if (messages.length > 0) {
+      setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
+    }
+  }, [messages]);
+
+  // ------------------- SELECTION -------------------
   const toggleMessageSelection = (id) => {
-    console.log(id);
-
     setSelectedMessages((prev) =>
-      prev.includes(id) ? prev.filter((msgId) => msgId !== id) : [...prev, id]
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
     );
   };
 
-  const handleLongPress = (item) => toggleMessageSelection(item.id);
+  const handleLongPress = (item) =>
+    toggleMessageSelection(item.id || item._id);
 
   const cancelSelection = () => {
     setSelectedMessages([]);
@@ -224,216 +230,192 @@ const GroupMessage = () => {
     setMessageText("");
   };
 
-  // ------------------ Delete Messages ------------------
-  const deleteSelectedMessages = async (messageId = null) => {
-    const messagesToDelete = messageId
-      ? [messageId] // single message delete
-      : selectedMessages; // multiple selected messages
-
-    if (!messagesToDelete.length) return Alert.alert("No messages selected");
-
-    try {
-      const token = await SecureStore.getItemAsync("token");
-      if (!token) return Alert.alert("Error", "No token found");
-
-    Alert.alert(
-      "Delete Messages",
-      `Delete ${selectedMessages.length} message(s)?`,
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Delete",
-          style: "destructive",
-          onPress: async () => {
-            try {
-              await axios.delete(`${process.env.EXPO_API_URL}/messages`, {
-                data: { ids: selectedMessages },
-              });
-              setMessages((prev) =>
-                prev.filter((msg) => !selectedMessages.includes(msg.id))
-              );
-              setSelectedMessages([]);
-            } catch (err) {
-              console.error("Delete failed:", err);
-            }
-          },
-        },
-      ]
-    );
-    } catch (err) {
-      console.error("Delete message error:", err);
-    }
-  };
-
-  // ------------------ Edit Message ------------------
   const editSelectedMessage = (message) => {
-    setEditingMessageId(message.id); // Mark this message as being edited
-    setMessageText(message.message); // Fill input with current message text
-    setSelectedMessages([message.id]); // Optional: highlight the selected message
+    const id = message.id || message._id;
+    setEditingMessageId(id);
+    setMessageText(message.message || "");
+    setSelectedMessages([id]);
   };
 
-  // ------------------ Send Message ------------------
+  const deleteSelectedMessages = async (messageId = null) => {
+    const ids = messageId ? [messageId] : selectedMessages;
+    if (!ids.length) return;
+
+    const token = await SecureStore.getItemAsync("token");
+    if (!token) return;
+
+    Alert.alert("Delete", `Delete ${ids.length} message(s)?`, [
+      { text: "Cancel" },
+      {
+        text: "Delete",
+        style: "destructive",
+        onPress: async () => {
+          await axios.delete(`${process.env.EXPO_API_URL}/messages`, {
+            data: { ids },
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          setMessages((prev) =>
+            prev.filter((m) => !ids.includes(m.id || m._id))
+          );
+          setSelectedMessages([]);
+        },
+      },
+    ]);
+  };
+
+  // ------------------- SEND MESSAGE -------------------
+  // GroupMessage.jsx  (only the handleSend part is shown)
   const handleSend = async (media) => {
-    if (media) {
-      console.log("This is the media we are receiving", media);
-    }
     if (!messageText.trim() && !media) return;
 
     try {
       setIsLoading(true);
       const token = await SecureStore.getItemAsync("token");
-      if (!token) return Alert.alert("Error", "No token found");
+      if (!token) return Alert.alert("Error", "Not logged in");
 
-      const API_URL = process.env.EXPO_API_URL;
-      if (!API_URL) {
-        console.error("❌ API URL is undefined!");
-        return;
-      }
+      const API = process.env.EXPO_API_URL;
 
-      // 🟩 Editing an existing message
+      // ----- EDIT -----
       if (editingMessageId && !media) {
-        const response = await axios.put(
-          `${API_URL}/messages/${editingMessageId}`,
+        await axios.put(
+          `${API}/messages/${editingMessageId}`,
           { message: messageText },
           { headers: { Authorization: `Bearer ${token}` } }
         );
-
-        if (response.data.success) {
-          setMessages((prev) =>
-            prev.map((msg) =>
-              msg.id === editingMessageId ? response.data.updatedMessage : msg
-            )
-          );
-          cancelSelection();
-        }
-        return; // stop here
+        cancelSelection();
+        return;
       }
 
-      // 🟦 If sending media
-      if (media && media.type !== "text") {
-        // 🟨 Handle CONTACT — no upload request
-        if (media.type === "contact") {
-          const contactData = {
-            name: media.name || "Unknown",
-            phone: media.phone || "No phone",
-            email: media.email || "No email",
-          };
-
-          const response = await axios.post(
-            `${API_URL}/groups/send/messages`,
-            {
-              contact_details: contactData,
-              groupId: GroupDetails.id,
-              status: "sent",
-              message_type: "contact",
-            },
-            { headers: { Authorization: `Bearer ${token}` } }
-          );
-
-          if (response.data.success) {
-            setMessages((prev) => [...prev, response.data.newMessage]);
-            setMessageText("");
-          }
-          return; // ✅ stop here — no need to upload
-        }
-
-        // 🟩 Otherwise (image/video) → upload first
-        const formData = new FormData();
-        formData.append("groupId", GroupDetails.id);
-        if (media.type === "image") {
-          formData.append("media_url", {
-            uri: media.uri,
-            name: `photo_${Date.now()}.jpg`,
+      // ----- BATCH IMAGES (gallery) -----
+      if (media?.type === "images" && media?.uris?.length) {
+        const uploaded = [];
+        for (const uri of media.uris) {
+          const fd = new FormData();
+          fd.append("groupId", GroupDetails.id);
+          const ext = uri.split(".").pop() || "jpg";
+          fd.append("media_url", {
+            uri,
+            name: `img_${Date.now()}.${ext}`,
             type: "image/jpeg",
           });
-        } else if (media.type === "video") {
-          formData.append("media_url", {
-            uri: media.uri,
-            name: `video_${Date.now()}.mp4`,
-            type: "video/mp4",
+
+          const up = await axios.post(`${API}/groups/send/messages/upload`, fd, {
+            headers: {
+              "Content-Type": "multipart/form-data",
+              Authorization: `Bearer ${token}`,
+            },
           });
-        } else if (media.type === "audio") {
-          formData.append("media_url", {
-            uri: media.uri,
-            name: `audio_${Date.now()}.mp3`,
-            type: "audio/mpeg",
-          });
-        } else if (media.type === "document") {
-          formData.append("media_url", {
-            uri: media.uri,
-            name: `document_${Date.now()}.pdf`,
-            type: "application/pdf",
-          });
+          if (up.data.success) uploaded.push(...up.data.fileUrls);
         }
 
-        console.log("Uploading to:", `${API_URL}/groups/send/messages/upload`);
+        if (uploaded.length) {
+          await axios.post(
+            `${API}/groups/send/messages`,
+            { fileUrls: uploaded, groupId: GroupDetails.id },
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+        }
+        setMessageText("");
+        return;
+      }
 
-        const res = await axios.post(`${API_URL}/groups/send/messages/upload`, formData, {
+      // ----- SINGLE MEDIA (image / video / audio / doc / contact) -----
+      if (media && media.type !== "text") {
+        const token = await SecureStore.getItemAsync("token");
+
+        // CONTACT – no upload
+        if (media.type === "contact") {
+          // ✅ Validate contact data exists
+          if (!media || !media.name) {
+            Alert.alert("Error", "Invalid contact data");
+            return;
+          }
+
+          await axios.post(`${API}/groups/send/messages`, {
+            contact_details: {                    // ✅ Now safe
+              name: media.name || "Unknown",
+              phone: media.phone || "",
+              email: media.email || "",
+            },
+            groupId: GroupDetails.id,
+            message_type: "contact",
+            status: "sent",
+          }, { headers: { Authorization: `Bearer ${token}` } });
+          setMessageText("");
+          return;
+        }
+
+        // UPLOAD + SEND (SINGLE FILE - SAME AS ONE-TO-ONE)
+        const fd = new FormData();
+        fd.append("groupId", GroupDetails.id);  // ← Group specific
+
+        const ext = media.uri.split(".").pop() || "jpg";
+        const mime = media.type === "image" ? "image/jpeg" :
+          media.type === "video" ? "video/mp4" :
+            media.type === "audio" ? "audio/m4a" : "application/octet-stream";
+
+        fd.append("media_url", {
+          uri: media.uri,
+          name: `${media.type}_${Date.now()}.${ext}`,
+          type: mime,
+        });
+
+        const up = await axios.post(`${API}/groups/send/messages/upload`, fd, {
           headers: {
             "Content-Type": "multipart/form-data",
-            Accept: "application/json",
             Authorization: `Bearer ${token}`,
           },
         });
 
-        console.log("Upload response:", res.data);
-
-        if (res.data.success) {
-          const result = await axios.post(
-            `${API_URL}/messages`,
-            {
-              media_url: res.data.fileUrl,
-              groupId: GroupDetails.id,
-              status: "sent",
-              message_type: media.type,
-            },
-            { headers: { Authorization: `Bearer ${token}` } }
-          );
-
-          if (result.data.success) {
-            setMessages((prev) => [...prev, result.data.newMessage]);
-            setMessageText("");
-          }
+        if (!up.data.success) {
+          Alert.alert("Error", "Upload failed");
+          return;
         }
+
+        // 🔥 FIX: Use media_url (SINGLE) like one-to-one
+        await axios.post(`${API}/groups/send/messages`, {
+          media_url: up.data.fileUrls[0],      // ← Take FIRST item from array
+          groupId: GroupDetails.id,
+          message_type: media.type,
+          status: "sent",
+        }, { headers: { Authorization: `Bearer ${token}` } });
+
+        setMessageText("");
         return;
       }
 
-      // 🟧 Sending plain text
-      const response = await axios.post(
-        `${API_URL}/groups/send/messages`,
-        {
-          message: messageText,
-          groupId: GroupDetails.id,
-          status: "sent",
-        },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-
-      if (response.data.success) {
-        setMessages((prev) => [...prev, response.data.newMessage]);
+      // ----- TEXT -----
+      if (messageText.trim()) {
+        await axios.post(
+          `${API}/groups/send/messages`,
+          {
+            message: messageText,
+            groupId: GroupDetails.id,
+            status: "sent",
+          },
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
         setMessageText("");
       }
-    } catch (err) {
-      console.error("❌ Send message error:", err.message);
-      if (err.response) console.log("Server response:", err.response.data);
+    } catch (e) {
+      console.error(e);
+      Alert.alert("Error", e.response?.data?.message || "Send failed");
     } finally {
       setIsLoading(false);
     }
   };
 
-  // ------------------ Clear Chat ------------------
-  const clearChat = async () => {
-    try {
-      const token = await SecureStore.getItemAsync("token");
-      if (!token) return Alert.alert("Error", "No token found");
-
-      // const response = await axios.
-    } catch (error) {}
-    setMessages([]);
-    cancelSelection();
+  // ------------------- WALLPAPER -------------------
+  const handleWallpaperChange = async (uri) => {
+    if (uri) {
+      await AsyncStorage.setItem("chat_wallpaper", uri);
+      setWallpaperUri(uri);
+    } else {
+      await AsyncStorage.removeItem("chat_wallpaper");
+      setWallpaperUri(null);
+    }
   };
 
-  // ------------------ Change Wallpaper ------------------
   useEffect(() => {
     Animated.timing(fadeAnim, {
       toValue: 1,
@@ -441,96 +423,68 @@ const GroupMessage = () => {
       useNativeDriver: true,
     }).start();
   }, []);
-  const handleWallpaperChange = async (uri) => {
-    if (uri) {
-      setWallpaperUri(uri);
-      await AsyncStorage.setItem("chat_wallpaper", uri);
-    } else {
-      setWallpaperUri(null);
-      await AsyncStorage.removeItem("chat_wallpaper");
-    }
-  };
 
+  // ------------------- RENDER -------------------
   return (
     <KeyboardAvoidingView
       behavior={Platform.OS === "ios" ? "padding" : "height"}
-      keyboardVerticalOffset={Platform.OS === "ios" ? 40 : 0}
-      style={{ flex: 1 }}
+      keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
+      className="flex-1 bg-slate-50"
     >
-      <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-        <SafeAreaView className="flex-1 bg-slate-50" edges={["top", "bottom"]}>
-          {/* Chat Header */}
-             <GroupChatHeader
-            onWallpaperChange={handleWallpaperChange}
-            onBlock={() => setIsBlocked(true)}
-            onClearChat={clearChat}
-            GroupDetails={GroupDetails}
-            onLeaveGroup={() => {
-              Alert.alert("Leave Group", "Leave this group?", [
-                { text: "Cancel", style: "cancel" },
-                {
-                  text: "Leave",
-                  style: "destructive",
-                  onPress: () => setHasLeftGroup(true),
-                },
-              ]);
-            }}
-          />
-
-          {/* Blocked Overlay */}
-          {
-            hasLeftGroup ? (
-            <View className="flex-1 justify-center items-center px-4">
-              <Text className="text-center text-gray-600 text-lg">
-                You have left this group. You cannot send or receive messages.
-              </Text>
-              <TouchableOpacity
-                onPress={() => router.back()}
-                className="mt-4 px-5 py-2 bg-indigo-600 rounded-full"
-              >
-                <Text className="text-white font-semibold text-center">
-                  Back to Groups
-                </Text>
-              </TouchableOpacity>
-            </View>
-          ) : isBlocked ? (
-            <BlockedOverlay
-              onUnblock={() => setIsBlocked(false)}
-              onDelete={() => {
-                Alert.alert(
-                  "Delete Chat",
-                  "Are you sure you want to delete this chat?",
-                  [
-                    { text: "Cancel", style: "cancel" },
-                    {
-                      text: "Delete",
-                      style: "destructive",
-                      onPress: () => {
-                        setMessages([]);
-                        setIsBlocked(false);
-                        router.back();
-                      },
-                    },
-                  ]
-                );
-              }}
+      <StatusBar barStyle="dark-content" backgroundColor="#f8fafc" />
+      <SafeAreaView className="flex-1">
+        <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+          <View className="flex-1">
+            {/* Header */}
+            <GroupChatHeader
+              onWallpaperChange={handleWallpaperChange}
+              onBlock={() => setIsBlocked(true)}
+              onClearChat={() => setMessages([])}
+              GroupDetails={GroupDetails}
+              onLeaveGroup={() =>
+                Alert.alert("Leave Group", "Are you sure?", [
+                  { text: "Cancel" },
+                  {
+                    text: "Leave",
+                    style: "destructive",
+                    onPress: () => setHasLeftGroup(true),
+                  },
+                ])
+              }
             />
-          ) : (
-            <>
-              {/* Selected Messages Action Bar */}
-              {selectedMessages.length > 0 && (
-                <SelectedMessagesActionBar
-                  selectedCount={selectedMessages.length}
-                  onEdit={editSelectedMessage}
-                  onDelete={deleteSelectedMessages}
-                  onCancel={cancelSelection}
-                />
-              )}
 
-              {/* Messages List */}
-              {type === "group" ? (
+            {/* Blocked / Left UI */}
+            {hasLeftGroup ? (
+              <View className="flex-1 justify-center items-center px-6">
+                <Text className="text-center text-lg text-gray-600">
+                  You have left this group.
+                </Text>
+                <TouchableOpacity
+                  onPress={() => router.back()}
+                  className="mt-6 px-6 py-3 bg-indigo-600 rounded-full"
+                >
+                  <Text className="text-white font-medium">
+                    Back to Groups
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            ) : isBlocked ? (
+              <BlockedOverlay onUnblock={() => setIsBlocked(false)} />
+            ) : (
+              <>
+                {/* Selection Bar */}
+                {selectedMessages.length > 0 && (
+                  <SelectedMessagesActionBar
+                    selectedCount={selectedMessages.length}
+                    onEdit={editSelectedMessage}
+                    onDelete={deleteSelectedMessages}
+                    onCancel={cancelSelection}
+                  />
+                )}
+
+                {/* Messages */}
                 <MessagesList
-                  type={type}
+                  type="group"
                   messages={messages}
                   setMessages={setMessages}
                   user={user}
@@ -540,35 +494,30 @@ const GroupMessage = () => {
                   fadeAnim={fadeAnim}
                   flatListRef={flatListRef}
                   wallpaperUri={wallpaperUri}
-                  onDeleteMessage={deleteSelectedMessages} // For real-time delete
-                  onEditMessage={editSelectedMessage} // For real-time edit
+                  onDeleteMessage={deleteSelectedMessages}
+                  onEditMessage={editSelectedMessage}
                   isLoading={isLoading}
                 />
-              ) : (
-                <View>
-                  <Text>Hello</Text>
-                </View>
-              )}
 
-              {/* Send Message Bar */}
-              <SendMessageBar
-                type={type}
-                messageText={messageText}
-                setMessageText={setMessageText}
-                editingMessageId={editingMessageId}
-                cancelEditing={cancelSelection}
-                onSend={handleSend}
-                user={user}
-                handleGetMessage={fetchMessages}
-                GroupDetails={GroupDetails}
-              />
-            </>
-          )}
-        </SafeAreaView>
-      </TouchableWithoutFeedback>
+                {/* Input */}
+                <SendMessageBar
+                  type="group"
+                  messageText={messageText}
+                  setMessageText={setMessageText}
+                  editingMessageId={editingMessageId}
+                  cancelEditing={cancelSelection}
+                  onSend={handleSend}
+                  user={user}
+                  handleGetMessage={fetchMessages}
+                  GroupDetails={GroupDetails}
+                />
+              </>
+            )}
+          </View>
+        </TouchableWithoutFeedback>
+      </SafeAreaView>
     </KeyboardAvoidingView>
   );
 };
-
 
 export default GroupMessage;

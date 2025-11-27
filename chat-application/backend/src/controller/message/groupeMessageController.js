@@ -18,20 +18,21 @@ export const SendGroupMessage = async (req, res) => {
       message_type = "text",
       contact_details = null,
       media_url = null,
+      fileUrls = null
     } = req.body;
 
     if (!groupId) {
-      return res
-        .status(400)
-        .json({ success: false, error: "Group ID is required" });
+      return res.status(400).json({ success: false, error: "Group ID is required" });
     }
 
+    // 🔥 MEMBERSHIP CHECK (CRITICAL)
     const [groupInfo] = await create_groups.execute(
       "SELECT admin_id FROM create_groups WHERE id = ?",
       [groupId]
     );
-    if (!groupInfo.length)
+    if (!groupInfo.length) {
       return res.status(404).json({ success: false, error: "Group not found" });
+    }
 
     const isAdmin = groupInfo[0].admin_id === sender_id;
     let isMember = false;
@@ -45,165 +46,142 @@ export const SendGroupMessage = async (req, res) => {
     }
 
     if (!isAdmin && !isMember) {
-      return res
-        .status(403)
-        .json({ success: false, error: "You are not a member of this group" });
+      return res.status(403).json({ success: false, error: "You are not a member of this group" });
     }
 
-    // ✅ Encrypt message
-    const encryptionKey =
-      process.env.MESSAGE_ENCRYPTION_KEY || "default_encryption_key";
-    let msgText = message;
-    let contactData =
-      contact_details && typeof contact_details === "object"
+    const encryptionKey = process.env.MESSAGE_ENCRYPTION_KEY || "default_encryption_key";
+
+    // 🔥 BATCH MEDIA (Multiple Images)
+    if (fileUrls && Array.isArray(fileUrls) && fileUrls.length > 0) {
+      const insertPromises = fileUrls.map(url =>
+        group_messages.execute(
+          "INSERT INTO group_messages (group_id, sender_id, message, message_type, media_url) VALUES (?, ?, ?, ?, ?)",
+          [groupId, sender_id, null, "image", url]
+        )
+      );
+
+      const results = await Promise.all(insertPromises);
+
+      const newGroupMessages = results.map((result, index) => ({
+        id: result[0].insertId,
+        _id: result[0].insertId,
+        sender_id,
+        group_id: groupId,
+        message: null,
+        message_type: "image",
+        media_url: fileUrls[index],
+        created_at: new Date(),
+        isSender: true,
+      }));
+
+      // ✅ Emit ARRAY of messages
+      io.to(`group_${groupId}`).emit("groupNewMessage", { newGroupMessages });
+
+      return res.json({ success: true, newGroupMessages });
+    }
+
+    // 🔥 SINGLE MEDIA
+    if (media_url && message_type !== "text") {
+      const [result] = await group_messages.execute(
+        "INSERT INTO group_messages (group_id, sender_id, message, message_type, media_url) VALUES (?, ?, ?, ?, ?)",
+        [groupId, sender_id, null, message_type, media_url]
+      );
+
+      const newGroupMessage = {
+        id: result.insertId,
+        _id: result.insertId,
+        sender_id,
+        group_id: groupId,
+        message: null,
+        message_type,
+        media_url,
+        created_at: new Date(),
+        isSender: true,
+      };
+
+      io.to(`group_${groupId}`).emit("groupNewMessage", { newGroupMessage });
+      return res.json({ success: true, newGroupMessage });
+    }
+
+    // 🔥 TEXT MESSAGE
+    if (message_type === "text" && message) {
+      const encryptedMessage = CryptoJS.AES.encrypt(message, encryptionKey).toString();
+
+      const [result] = await group_messages.execute(
+        "INSERT INTO group_messages (group_id, sender_id, message, message_type) VALUES (?, ?, ?, ?)",
+        [groupId, sender_id, encryptedMessage, message_type]
+      );
+
+      const newGroupMessage = {
+        id: result.insertId,
+        _id: result.insertId,
+        sender_id,
+        group_id: groupId,
+        message, // ✅ Decrypted for UI
+        message_type,
+        created_at: new Date(),
+        isSender: true,
+      };
+
+      io.to(`group_${groupId}`).emit("groupNewMessage", { newGroupMessage });
+      return res.json({ success: true, newGroupMessage });
+    }
+
+    // 🔥 CONTACT
+    if (message_type === "contact" && contact_details) {
+      const contactData = typeof contact_details === "object"
         ? JSON.stringify(contact_details)
         : contact_details;
+      const encryptedContact = CryptoJS.AES.encrypt(contactData, encryptionKey).toString();
 
-    if (message_type === "text" && msgText) {
-      msgText = CryptoJS.AES.encrypt(msgText, encryptionKey).toString();
+      const [result] = await group_messages.execute(
+        "INSERT INTO group_messages (group_id, sender_id, message_type, contact_details) VALUES (?, ?, ?, ?)",
+        [groupId, sender_id, message_type, encryptedContact]
+      );
+
+      const newGroupMessage = {
+        id: result.insertId,
+        _id: result.insertId,
+        sender_id,
+        group_id: groupId,
+        message_type,
+        contact_details, // ✅ Original for UI
+        created_at: new Date(),
+        isSender: true,
+      };
+
+      io.to(`group_${groupId}`).emit("groupNewMessage", { newGroupMessage });
+      return res.json({ success: true, newGroupMessage });
     }
 
-    if (message_type === "contact" && contactData) {
-      contactData = CryptoJS.AES.encrypt(contactData, encryptionKey).toString();
-    }
+    return res.status(400).json({ success: false, error: "Invalid message data" });
 
-    // ✅ Save encrypted
-    // const [result] = await group_messages.execute(
-    //   "INSERT INTO group_messages (group_id, sender_id, message, message_type, contact_details, media_url) VALUES (?, ?, ?, ?, ?, ?)",
-    //   [groupId, sender_id, msgText, message_type, contactData, media_url]
-    // );
-
-    const contactDetailsJSON =
-      contact_details && typeof contact_details === "object"
-        ? JSON.stringify(contact_details)
-        : contact_details || null;
-
-    const [result] = await group_messages.execute(
-      "INSERT INTO group_messages (group_id, sender_id, message, message_type, contact_details, media_url) VALUES (?, ?, ?, ?, ?, ?)",
-      [groupId, sender_id, msgText, message_type, contactDetailsJSON, media_url]
-    );
-
-    // ✅ Decrypt for sender’s UI
-    const decrypt = (cipher) => {
-      try {
-        const bytes = CryptoJS.AES.decrypt(cipher, encryptionKey);
-        return bytes.toString(CryptoJS.enc.Utf8);
-      } catch {
-        return cipher;
-      }
-    };
-
-    const decryptedMessage =
-      message_type === "text" && msgText ? decrypt(msgText) : message;
-    const decryptedContact =
-      message_type === "contact" && contactData
-        ? decrypt(contactData)
-        : contact_details;
-
-    // ✅ New message object
-    const newGroupMessage = {
-      id: result.insertId,
-      sender_id,
-      group_id: groupId,
-      message: decryptedMessage,
-      message_type,
-      contact_details: decryptedContact || null,
-      media_url: media_url || null,
-      created_at: new Date(),
-      isSender: true,
-    };
-
-    io.to(`group_${groupId}`).emit("groupNewMessage", newGroupMessage);
-
-    return res.json({ success: true, newGroupMessage });
   } catch (error) {
-    console.error("❌ Error sending group message:", error);
-    res
-      .status(500)
-      .json({ success: false, error: "Failed to send group message" });
+    console.error("❌ SendGroupMessage ERROR:", error);
+    res.status(500).json({ success: false, error: "Failed to send message" });
   }
 };
-
 export const SendGroupMessageUploadController = async (req, res) => {
+  //TODO: Handle file upload 
   try {
     if (!req.files || req.files.length === 0) {
-      return res
-        .status(400)
-        .json({ success: false, message: "No file uploaded" });
+      return res.status(400).json({ success: false, message: "No file uploaded" });
     }
 
-    const groupId = req.body.groupId || null;
-    const senderId = req.user?.id || null;
+    // ✅ Return URLs ONLY - NO DB INSERT
+    const fileUrls = req.files.map(file => file.path);  // ← Array of URLs
 
-    if (!groupId || !senderId) {
-      return res.status(400).json({
-        success: false,
-        message: "Missing groupId or senderId",
-      });
-    }
-
-    const getType = (file) => {
-      if (file.mimetype.startsWith("image/")) return "image";
-      if (file.mimetype.startsWith("video/")) return "video";
-      if (file.mimetype.startsWith("audio/")) return "audio";
-      if (file.mimetype === "application/pdf" || file.mimetype === "image/pdf")
-        return "document";
-      if (file.mimetype === "text/contact") return "text";
-      return "file";
-    };
-    console.log(getType);
-
-    const fileTypes = req.files.map(getType);
-    const hasVideo = fileTypes.includes("video");
-    const hasAudio = fileTypes.includes("audio");
-
-    if ((hasVideo || hasAudio) && req.files.length > 1) {
-      return res.status(400).json({
-        success: false,
-        message: "You can upload only one video or one audio file at a time.",
-      });
-    }
-
-    // Extract media info safely
-    const mediaType = fileTypes[0] || "file";
-    const mediaPath = req.files[0]?.path || null;
-
-    if (!mediaPath) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid file path or missing file",
-      });
-    }
-
-    // ✅ Insert into DB
-    const [newGroupMessage] = await group_messages.execute(
-      `INSERT INTO group_messages (group_id, sender_id, message, message_type, media_url) VALUES (?, ?, ?, ?, ?)`,
-      [groupId, senderId, null, mediaType, mediaPath]
-    );
-    console.log(newGroupMessage);
-
-    const uploadedFiles = req.files.map((file) => ({
-      url: file.path,
-      type: file.mimetype,
-      filename: file.filename,
-    }));
-
-    // ✅ Emit to socket
-    io.to(`group_${groupId}`).emit("groupNewMessage", newGroupMessage);
-    console.log(`📡 Emitted message to group_${groupId}`, newGroupMessage);
-
-    return res.status(200).json({
+    return res.json({
       success: true,
-      message: "File(s) uploaded successfully",
-      fileUrl: uploadedFiles[0].url,
-      files: uploadedFiles,
+      fileUrl: fileUrls[0],     // Single file
+      fileUrls                 // Multiple files
     });
+
   } catch (err) {
     console.error("Upload error:", err);
     res.status(500).json({ success: false, message: err.message });
   }
 };
-
 // Get messages for a specific group
 export const GetGroupMessages = async (req, res) => {
   try {
@@ -676,19 +654,19 @@ export const leaveGroup = async (req, res) => {
     }
 
     // check its user or admin leaving the group
-    const  [groupInfoRows] = await create_groups.execute(
+    const [groupInfoRows] = await create_groups.execute(
       `SELECT admin_id FROM create_groups WHERE id = ?`,
       [groupId, userId]
     );
-    
+
     const [groupeMemberRows] = await group_members.execute(
       `SELECT * FROM group_members WHERE group_id = ? AND user_id = ?`,
       [groupId, userId]
     );
-    if(groupeMemberRows.length === 0 || groupeMemberRows[0].Leave_Group === 1){
+    if (groupeMemberRows.length === 0 || groupeMemberRows[0].Leave_Group === 1) {
       return res
-      .status(400)
-      .json({ error: "You are not a member of this group"});
+        .status(400)
+        .json({ error: "You are not a member of this group" });
     }
 
     const adminId = groupInfoRows[0].admin_id;
@@ -717,10 +695,10 @@ export const leaveGroup = async (req, res) => {
       leaveGroupResult,
     })
 
-    
+
   } catch (error) {
     console.log("Internal Error in leave group:", error);
-    
+
   }
 }
 
